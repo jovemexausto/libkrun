@@ -18,8 +18,6 @@ use krun_display::{
     DisplayBackend, DisplayBackendBasicFramebuffer, DisplayBackendInstance, Rect, ResourceFormat,
 };
 use libc::c_void;
-#[cfg(target_os = "macos")]
-use rutabaga_gfx::RUTABAGA_MEM_HANDLE_TYPE_APPLE;
 #[cfg(all(feature = "virgl_resource_map2", target_os = "linux"))]
 use rutabaga_gfx::RUTABAGA_MEM_HANDLE_TYPE_DMABUF;
 #[cfg(all(not(feature = "virgl_resource_map2"), target_os = "linux"))]
@@ -37,8 +35,10 @@ use rutabaga_gfx::{
     Transfer3D,
 };
 #[cfg(target_os = "macos")]
+use rutabaga_gfx::{RUTABAGA_MEM_HANDLE_TYPE_APPLE, RUTABAGA_MEM_HANDLE_TYPE_SHM};
+#[cfg(target_os = "macos")]
 use utils::worker_message::WorkerMessage;
-use vm_memory::{GuestAddress, GuestMemory, GuestMemoryMmap, VolatileSlice};
+use vm_memory::{GuestAddress, GuestMemory, GuestMemoryBackend, GuestMemoryMmap, VolatileSlice};
 
 use super::{GpuError, Result};
 use crate::virtio::display::DisplayInfo;
@@ -299,6 +299,71 @@ impl VirtioGpu {
         builder.clone().build(fence.clone(), None).ok()
     }
 
+    /// Create a Rutabaga instance backed by gfxstream (Vulkan-only path).
+    ///
+    /// Unlike `create_rutabaga()` this does not require a Wayland/X11 display
+    /// socket. It initialises gfxstream with `use_vulkan=true` and all GL/EGL
+    /// flags disabled, which matches the `GFXSTREAM_ENABLE_HOST_GLES=0` build
+    /// of libgfxstream_backend.dylib produced in SP-1.
+    ///
+    /// `display_width` / `display_height` are the initial framebuffer dimensions
+    /// reported to the guest; they can be zero for headless/offscreen builds.
+    #[cfg(feature = "gpu-gfxstream")]
+    pub fn create_rutabaga_gfxstream(
+        mem: GuestMemoryMmap,
+        queue_ctl: Arc<Mutex<VirtQueue>>,
+        interrupt: InterruptTransport,
+        fence_state: Arc<Mutex<FenceState>>,
+        display_width: u32,
+        display_height: u32,
+    ) -> Option<Rutabaga> {
+        // Vulkan-only: configure via RutabagaBuilder fluent API.
+        //
+        // use_gles(false) matches the libgfxstream_backend.dylib actually
+        // shipped here (GFXSTREAM_ENABLE_HOST_GLES=0 / -Ddecoders=vulkan).
+        // Requesting use_gles(true) against that dylib doesn't get silently
+        // ignored -- stream_renderer_init fails outright ("Failed to
+        // initialize renderer.") because the GLES decoder it would need
+        // isn't compiled in.
+        //
+        // A `-Ddecoders=vulkan,gles,composer` build exists experimentally
+        // (see capivara-gfxstream-gles-host-build memory note) and does
+        // initialize with use_egl(false)+use_gles(true) -- EGL_BIT maps to
+        // gfxstream's `EglOnEgl` feature, which would otherwise route the
+        // GLES translator through egl_os_api_egl.cpp's dlopen of a host
+        // libEGL.so/libGLESv2.so that doesn't exist on macOS; EglOnEgl off
+        // picks the native egl_os_api_darwin.cpp path instead. But that path
+        // is GLSL ES 3.0 via Apple's internal ANGLE-over-Metal shim
+        // (GL_VENDOR "Google (Apple)"), and gfxstream's own internal blit
+        // shader (texture_draw.cpp) fails to compile under it with an empty
+        // info log regardless of #version pragma -- not yet root-caused, so
+        // that build isn't wired up as the default here.
+        let builder = RutabagaBuilder::new(
+            rutabaga_gfx::RutabagaComponentType::Gfxstream,
+            0, // virgl_flags — unused by gfxstream component
+            0, // capset_mask — let gfxstream report its own capsets
+        )
+        .set_display_width(display_width)
+        .set_display_height(display_height)
+        .set_use_egl(false)
+        .set_use_gles(false)
+        .set_use_glx(false)
+        .set_use_surfaceless(false)
+        .set_use_vulkan(true)
+        .set_use_external_blob(true)
+        .set_use_system_blob(false);
+
+        let fence =
+            Self::create_fence_handler(mem, queue_ctl.clone(), fence_state.clone(), interrupt);
+        match builder.build(fence, None) {
+            Ok(rutabaga) => Some(rutabaga),
+            Err(e) => {
+                error!("gfxstream rutabaga init failed: {e:?}");
+                None
+            }
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         mem: GuestMemoryMmap,
@@ -325,6 +390,69 @@ impl VirtioGpu {
                 warn!(
                     "Failed to create virtio_gpu backend with the requested parameters. Falling back to safe defaults."
                 );
+                Self::create_fallback_rutabaga(
+                    mem.clone(),
+                    queue_ctl.clone(),
+                    interrupt.clone(),
+                    fence_state.clone(),
+                )
+                .expect("Fallback rutabaga initialization failed")
+            }
+        };
+
+        let display_backend = display_backend
+            .create_instance()
+            .expect("Failed to create display backend instance!");
+
+        Self {
+            rutabaga,
+            resources: Default::default(),
+            fence_state,
+            scanouts: Default::default(),
+            displays,
+            display_backend,
+            #[cfg(target_os = "macos")]
+            map_sender,
+        }
+    }
+
+    /// Variant of [`new`] for the macOS + gfxstream (Vulkan-only) path.
+    ///
+    /// Does not need `virgl_flags`; creates the Rutabaga instance via
+    /// `create_rutabaga_gfxstream` and falls back to a headless 2-D renderer if
+    /// that fails. The `map_sender` is required: gfxstream's ASG ring buffer is a
+    /// HOST3D blob that `resource_map_blob` maps into the guest via
+    /// `WorkerMessage::GpuAddMapping` (hv_vm_map), so the channel must be the live
+    /// one serviced by the vmm worker, not a disconnected stub.
+    #[cfg(all(target_os = "macos", feature = "gpu-gfxstream"))]
+    pub fn new_gfxstream(
+        mem: GuestMemoryMmap,
+        queue_ctl: Arc<Mutex<VirtQueue>>,
+        interrupt: InterruptTransport,
+        map_sender: Sender<WorkerMessage>,
+        export_table: Option<ExportTable>,
+        displays: Box<[DisplayInfo]>,
+        display_backend: DisplayBackend,
+    ) -> Self {
+        let fence_state = Arc::new(Mutex::new(Default::default()));
+
+        // Use display dimensions from the first scanout, or sensible defaults.
+        let (display_width, display_height) = displays
+            .first()
+            .map(|d| (d.width, d.height))
+            .unwrap_or((1280, 1024));
+
+        let rutabaga = match Self::create_rutabaga_gfxstream(
+            mem.clone(),
+            queue_ctl.clone(),
+            interrupt.clone(),
+            fence_state.clone(),
+            display_width,
+            display_height,
+        ) {
+            Some(r) => r,
+            None => {
+                warn!("Failed to initialise gfxstream backend; falling back to 2-D renderer");
                 Self::create_fallback_rutabaga(
                     mem.clone(),
                     queue_ctl.clone(),
@@ -585,12 +713,23 @@ impl VirtioGpu {
     /// Can also be used to invalidate caches.
     pub fn transfer_read(
         &mut self,
-        _ctx_id: u32,
-        _resource_id: u32,
-        _transfer: Transfer3D,
-        _buf: Option<VolatileSlice>,
+        ctx_id: u32,
+        resource_id: u32,
+        transfer: Transfer3D,
+        buf: Option<VolatileSlice>,
     ) -> VirtioGpuResult {
-        panic!("virtio_gpu: transfer_read unimplemented");
+        // gfxstream's ASG ring relies on TRANSFER_FROM_HOST_3D to read host-produced
+        // data back (e.g. the ring's read pointer / response area). The control-queue
+        // call path passes `buf: None`, transferring into the resource's own backing;
+        // support an explicit destination slice too for completeness.
+        let buf = buf.map(|s| {
+            // SAFETY: the volatile slice points at a live, correctly-sized guest
+            // mapping for the duration of this call.
+            unsafe { IoSliceMut::new(std::slice::from_raw_parts_mut(s.ptr_guard_mut().as_ptr(), s.len())) }
+        });
+        self.rutabaga
+            .transfer_read(ctx_id, resource_id, transfer, buf)?;
+        Ok(OkNoData)
     }
 
     /// Attaches backing memory to the given resource, represented by a `Vec` of `(address, size)`
@@ -905,7 +1044,14 @@ impl VirtioGpu {
         let map_ptr = self.rutabaga.map_ptr(resource_id).map_err(|_| ErrUnspec)?;
 
         if let Ok(export) = self.rutabaga.export_blob(resource_id) {
-            if export.handle_type == RUTABAGA_MEM_HANDLE_TYPE_APPLE {
+            debug!(
+                "resource_map_blob: export handle_type={} map_ptr={:x}",
+                export.handle_type, map_ptr
+            );
+
+            if export.handle_type == RUTABAGA_MEM_HANDLE_TYPE_APPLE
+                || export.handle_type == RUTABAGA_MEM_HANDLE_TYPE_SHM
+            {
                 if offset + resource.size > shm_region.size as u64 {
                     error!("mapping DOES NOT FIT");
                     return Err(ErrUnspec);
@@ -930,6 +1076,10 @@ impl VirtioGpu {
                     return Err(ErrUnspec);
                 }
             } else {
+                error!(
+                    "resource_map_blob: unsupported export handle_type={} for resource {}",
+                    export.handle_type, resource_id
+                );
                 return Err(ErrUnspec);
             }
         } else {

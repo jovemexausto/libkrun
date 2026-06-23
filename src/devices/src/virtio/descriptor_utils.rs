@@ -6,15 +6,16 @@ use std::cmp;
 use std::collections::VecDeque;
 use std::fmt::{self, Display};
 use std::io::{self, Read, Write};
-use std::mem::{MaybeUninit, size_of};
+use std::mem::{size_of, MaybeUninit};
 use std::ops::Deref;
 use std::ptr::copy_nonoverlapping;
 use std::result;
 
 use crate::virtio::queue::DescriptorChain;
 use vm_memory::{
-    Address, ByteValued, Bytes, GuestAddress, GuestMemory, GuestMemoryError, GuestMemoryMmap,
-    GuestMemoryRegion, Le16, Le32, Le64, VolatileMemory, VolatileMemoryError, VolatileSlice,
+    Address, ByteValued, Bytes, GuestAddress, GuestMemory, GuestMemoryBackend, GuestMemoryError,
+    GuestMemoryMmap, GuestMemoryRegion, Le16, Le32, Le64, VolatileMemory, VolatileMemoryError,
+    VolatileSlice,
 };
 
 use super::file_traits::{FileReadWriteAtVolatile, FileReadWriteVolatile};

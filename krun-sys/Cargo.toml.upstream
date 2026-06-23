@@ -8,6 +8,7 @@ repository = "https://github.com/containers/libkrun"
 license = "Apache-2.0"
 links = "krun"
 
+[workspace]
 
 [build-dependencies]
 bindgen = { version = "0.72.1", default-features = false }

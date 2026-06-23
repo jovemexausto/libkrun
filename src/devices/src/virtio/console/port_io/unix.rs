@@ -1,16 +1,16 @@
 use libc::{
-    F_GETFL, F_SETFL, O_NONBLOCK, STDERR_FILENO, STDIN_FILENO, STDOUT_FILENO, TIOCGWINSZ, fcntl,
+    fcntl, F_GETFL, F_SETFL, O_NONBLOCK, STDERR_FILENO, STDIN_FILENO, STDOUT_FILENO, TIOCGWINSZ,
 };
 use nix::errno::Errno;
 use nix::ioctl_read_bad;
-use nix::poll::{PollFd, PollFlags, PollTimeout, poll};
+use nix::poll::{poll, PollFd, PollFlags, PollTimeout};
 use nix::unistd::{dup, isatty};
 use std::fs::File;
 use std::io::{self, ErrorKind};
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd, RawFd};
-use utils::eventfd::{EFD_NONBLOCK, EventFd};
+use utils::eventfd::{EventFd, EFD_NONBLOCK};
 use vm_memory::bitmap::Bitmap;
-use vm_memory::{VolatileMemoryError, VolatileSlice, WriteVolatile};
+use vm_memory::VolatileSlice;
 
 use super::{PortInput, PortInputEmpty, PortOutput, PortTerminalProperties};
 
@@ -136,13 +136,14 @@ impl AsRawFd for PortOutputFd {
 
 impl PortOutput for PortOutputFd {
     fn write_volatile(&mut self, buf: &VolatileSlice) -> Result<usize, io::Error> {
-        self.0.write_volatile(buf).map_err(|e| match e {
-            VolatileMemoryError::IOError(e) => e,
-            e => {
-                log::error!("Unsuported error from write_volatile: {e:?}");
-                io::Error::other(e)
-            }
-        })
+        let guard = buf.ptr_guard();
+        let src = guard.as_ptr().cast::<libc::c_void>();
+        let bytes_written = unsafe { libc::write(self.as_raw_fd(), src, buf.len()) };
+        if bytes_written < 0 {
+            Err(io::Error::last_os_error())
+        } else {
+            Ok(bytes_written.try_into().unwrap())
+        }
     }
 
     fn wait_until_writable(&self) {

@@ -21,6 +21,8 @@ mod rutabaga_snapshot;
 mod rutabaga_utils;
 mod virgl_renderer;
 
+#[cfg(feature = "gfxstream")]
+pub use crate::gfxstream::transfer_read_blocking_by_id;
 pub use crate::rutabaga_core::Rutabaga;
 pub use crate::rutabaga_core::RutabagaBuilder;
 pub use crate::rutabaga_core::calculate_capset_mask;

@@ -18,10 +18,10 @@ use std::os::fd::AsRawFd;
 use std::os::fd::{BorrowedFd, FromRawFd};
 #[cfg(windows)]
 use std::os::windows::io::{AsRawHandle, BorrowedHandle, FromRawHandle};
-#[cfg(windows)]
 use std::path::PathBuf;
 use std::sync::atomic::AtomicI32;
 use std::sync::{Arc, Mutex};
+use vm_memory::GuestMemoryBackend;
 #[cfg(windows)]
 use utils::windows::SendHandle;
 #[cfg(windows)]
@@ -614,15 +614,21 @@ pub fn build_microvm(
 
     if let Some(kernel_console) = &vm_resources.kernel_console {
         let cmdline = kernel_cmdline.as_str();
-        let console_start_idx = cmdline.find("console=").unwrap();
-        let console_end_idx = cmdline
-            .get(console_start_idx..)
-            .and_then(|s| s.find(" ").map(|i| i + console_start_idx));
+        let cmdline = if let Some(console_start_idx) = cmdline.find("console=") {
+            let console_end_idx = cmdline
+                .get(console_start_idx..)
+                .and_then(|s| s.find(' ').map(|i| i + console_start_idx))
+                .unwrap_or(cmdline.len());
 
-        let cmdline = cmdline.replace(
-            &cmdline[console_start_idx..console_end_idx.unwrap()],
-            format!("console={kernel_console}").as_str(),
-        );
+            cmdline.replace(
+                &cmdline[console_start_idx..console_end_idx],
+                format!("console={kernel_console}").as_str(),
+            )
+        } else if cmdline.is_empty() {
+            format!("console={kernel_console}")
+        } else {
+            format!("{cmdline} console={kernel_console}")
+        };
         kernel_cmdline = Cmdline::new(arch::CMDLINE_MAX_SIZE);
         kernel_cmdline.insert_str(cmdline).unwrap();
     }
@@ -745,6 +751,17 @@ pub fn build_microvm(
     };
 
     let mut serial_devices = Vec::new();
+
+    // Create the legacy serial device if we're booting from a firmware
+    if vm_resources.firmware_config.is_some() && !vm_resources.disable_implicit_console {
+        serial_devices.push(setup_serial_device(
+            event_manager,
+            None,
+            None,
+            // Uncomment this to get EFI output when debugging EDK2.
+            //Some(Box::new(io::stdout())),
+        )?);
+    };
 
     // We can't call to `setup_terminal_raw_mode` until `Vmm` is created,
     // so let's keep track of FDs connected to legacy serial devices here
@@ -1031,15 +1048,29 @@ pub fn build_microvm(
             attach_rng_device(&mut vmm, event_manager, intc.clone())?;
         }
     }
-    for (console_id, console_cfg) in vm_resources.virtio_consoles.iter().enumerate() {
+    let mut console_id = 0;
+    if !vm_resources.disable_implicit_console {
+        attach_console_devices(
+            &mut vmm,
+            event_manager,
+            intc.clone(),
+            vm_resources,
+            None,
+            console_id,
+        )?;
+        console_id += 1;
+    }
+
+    for console_cfg in vm_resources.virtio_consoles.iter() {
         attach_console_devices(
             &mut vmm,
             event_manager,
             intc.clone(),
             vm_resources,
             Some(console_cfg),
-            console_id as u32,
+            console_id,
         )?;
+        console_id += 1;
     }
 
     #[cfg(not(any(feature = "tee", feature = "aws-nitro")))]
@@ -1778,23 +1809,6 @@ pub(crate) fn setup_vm(
         .map_err(StartMicrovmError::Internal)?;
     Ok(vm)
 }
-
-#[cfg(all(feature = "tee", target_arch = "x86_64"))]
-fn validate_tee_config(tee: Tee) -> std::result::Result<(), StartMicrovmError> {
-    match tee {
-        #[cfg(feature = "amd-sev")]
-        Tee::Snp => Ok(()),
-        #[cfg(feature = "tdx")]
-        Tee::Tdx => Ok(()),
-        _ => Err(StartMicrovmError::InvalidTee),
-    }
-}
-
-#[cfg(all(feature = "tee", not(target_arch = "x86_64")))]
-fn validate_tee_config(_tee: Tee) -> std::result::Result<(), StartMicrovmError> {
-    Err(StartMicrovmError::InvalidTee)
-}
-
 #[cfg(all(target_os = "linux", feature = "tee"))]
 pub(crate) fn setup_vm(
     kvm: &KvmContext,
@@ -1802,8 +1816,6 @@ pub(crate) fn setup_vm(
     resources: &super::resources::VmResources,
     #[cfg(feature = "tdx")] _sender: Sender<WorkerMessage>,
 ) -> std::result::Result<Vm, StartMicrovmError> {
-    validate_tee_config(resources.tee_config().tee)?;
-
     let mut vm = Vm::new(
         kvm.fd(),
         resources.tee_config(),
@@ -2113,6 +2125,10 @@ fn attach_mmio_device(
     vmm.mmio_device_manager
         .add_device_to_cmdline(_cmdline, _mmio_base, _irq)?;
 
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    vmm.mmio_device_manager
+        .add_device_to_cmdline(_cmdline, _mmio_base, _irq)?;
+
     Ok(())
 }
 
@@ -2171,14 +2187,40 @@ fn attach_fs_devices(
 #[cfg(unix)]
 fn autoconfigure_console_ports(
     vmm: &mut Vmm,
-    _vm_resources: &VmResources,
+    vm_resources: &VmResources,
     cfg: Option<&DefaultVirtioConsoleConfig>,
+    creating_implicit_console: bool,
 ) -> std::result::Result<Vec<PortDescription>, StartMicrovmError> {
-    let (input_fd, output_fd, err_fd) = match cfg {
-        Some(c) => (c.input_fd, c.output_fd, c.err_fd),
-        None => (STDIN_FILENO, STDOUT_FILENO, STDERR_FILENO),
-    };
+    use self::StartMicrovmError::*;
+
+    let mut console_output_path: Option<PathBuf> = None;
+    if let Some(path) = vm_resources.console_output.clone()
+        && !vm_resources.disable_implicit_console
+        && creating_implicit_console
     {
+        console_output_path = Some(path)
+    }
+
+    if let Some(console_output_path) = console_output_path {
+        let file = File::create(console_output_path).map_err(OpenConsoleFile)?;
+        // Manually emulate our Legacy behavior: In the case of output_path we have always used the
+        // stdin to determine the console size
+        let stdin_fd = unsafe { BorrowedFd::borrow_raw(STDIN_FILENO) };
+        let term_fd = if isatty(stdin_fd).is_ok_and(|v| v) {
+            port_io::term_fd(stdin_fd.as_raw_fd()).unwrap()
+        } else {
+            port_io::term_fixed_size(0, 0)
+        };
+        Ok(vec![PortDescription::console(
+            Some(port_io::input_empty().unwrap()),
+            Some(port_io::output_file(file).unwrap()),
+            term_fd,
+        )])
+    } else {
+        let (input_fd, output_fd, err_fd) = match cfg {
+            Some(c) => (c.input_fd, c.output_fd, c.err_fd),
+            None => (STDIN_FILENO, STDOUT_FILENO, STDERR_FILENO),
+        };
         let input_is_terminal =
             input_fd >= 0 && isatty(unsafe { BorrowedFd::borrow_raw(input_fd) }).unwrap_or(false);
         let output_is_terminal =
@@ -2206,8 +2248,7 @@ fn autoconfigure_console_ports(
                 forwarding_sigint = true;
                 let sigint_input = port_io::PortInputSigInt::new();
                 let sigint_input_fd = sigint_input.sigint_evt().as_raw_fd();
-                register_sigint_handler(sigint_input_fd)
-                    .map_err(StartMicrovmError::RegisterFsSigwinch)?;
+                register_sigint_handler(sigint_input_fd).map_err(RegisterFsSigwinch)?;
                 Some(Box::new(sigint_input) as _)
             }
             #[cfg(not(target_os = "linux"))]
@@ -2531,11 +2572,16 @@ fn attach_console_devices(
 ) -> std::result::Result<(), StartMicrovmError> {
     use self::StartMicrovmError::*;
 
+    let creating_implicit_console = cfg.is_none();
+
     let ports = match cfg {
-        None => autoconfigure_console_ports(vmm, vm_resources, None)?,
-        Some(VirtioConsoleConfigMode::Autoconfigure(autocfg)) => {
-            autoconfigure_console_ports(vmm, vm_resources, Some(autocfg))?
-        }
+        None => autoconfigure_console_ports(vmm, vm_resources, None, creating_implicit_console)?,
+        Some(VirtioConsoleConfigMode::Autoconfigure(autocfg)) => autoconfigure_console_ports(
+            vmm,
+            vm_resources,
+            Some(autocfg),
+            creating_implicit_console,
+        )?,
         Some(VirtioConsoleConfigMode::Explicit(ports)) => create_explicit_ports(vmm, ports)?,
     };
 

@@ -56,6 +56,16 @@ endif
 ifeq ($(GPU),1)
     FEATURE_FLAGS += --features gpu
 endif
+ifeq ($(GFXSTREAM),1)
+    # Vulkan-only GPU via gfxstream — requires libgfxstream_backend.dylib
+    # Set GFXSTREAM_PATH to the build-macos/host directory from SP-1:
+    #   GFXSTREAM_PATH=<path>/build-macos/host GFXSTREAM=1 make
+    FEATURE_FLAGS += --features gpu-gfxstream
+    ifndef GFXSTREAM_PATH
+        $(error GFXSTREAM=1 requires GFXSTREAM_PATH to be set to the \
+                directory containing libgfxstream_backend.dylib)
+    endif
+endif
 ifeq ($(INPUT),1)
     FEATURE_FLAGS += --features input
 endif

@@ -180,7 +180,7 @@ int main(int argc, char *const argv[])
 
     // Enable debug output if configured.
     log_level = (cmdline.debug) ? KRUN_LOG_LEVEL_DEBUG : KRUN_LOG_LEVEL_OFF;
-    err = krun_init_log(KRUN_LOG_TARGET_DEFAULT, log_level, KRUN_LOG_STYLE_AUTO, 0);
+    err = krun_set_log_level(log_level);
     if (err) {
         errno = -err;
         perror("Error configuring log level");
@@ -203,14 +203,14 @@ int main(int argc, char *const argv[])
         return -1;
     }
 
-    if (err = krun_add_virtio_console_default(ctx_id, -1, STDOUT_FILENO, -1)) {
+    if (err = krun_set_console_output(ctx_id, "/dev/stdout")) {
         errno = -err;
-        perror("Error configuring the console");
+        perror("Error configuring the console output");
         return -1;
     }
 
     // Configure the enclave's rootfs.
-    if (err = krun_add_virtiofs3(ctx_id, KRUN_FS_ROOT_TAG, cmdline.new_root, 0, false)) {
+    if (err = krun_set_root(ctx_id, cmdline.new_root)) {
         errno = -err;
         perror("Error configuring enclave rootfs");
         return -1;

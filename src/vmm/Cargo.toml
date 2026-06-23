@@ -15,6 +15,7 @@ tdx = ["blk", "tee", "kbs-types", "serde", "serde_json", "dep:tdx", "devices/tdx
 net = ["devices/net"]
 blk = ["devices/blk"]
 gpu = ["devices/gpu", "krun_display"]
+gpu-gfxstream = ["devices/gpu-gfxstream", "krun_display"]
 input = ["devices/input", "krun_input"]
 aws-nitro = []
 vhost-user = ["devices/vhost-user"]
@@ -25,7 +26,7 @@ flate2 = "1.0.35"
 libc = ">=0.2.39"
 linux-loader = { version = "0.13.2", features = ["bzimage", "elf", "pe"] }
 log = "0.4.0"
-vm-memory = { version = "0.17.0", default-features = false, features = ["backend-mmap"] }
+vm-memory = { version = "0.18.0", default-features = false, features = ["backend-mmap"] }
 vmm-sys-util = "0.14"
 krun_display = { package = "krun-display", version = "0.1.0", path = "../display", optional = true, features = ["bindgen_clang_runtime"] }
 krun_input = { package = "krun-input", version = "0.1.0", path = "../input", optional = true, features = ["bindgen_clang_runtime"] }

@@ -17,6 +17,8 @@ tdx = ["blk", "tee", "vmm/tdx", "devices/tdx", "init-blob/tdx"]
 net = ["devices/net", "vmm/net"]
 blk = ["devices/blk", "vmm/blk"]
 gpu = ["vmm/gpu", "devices/gpu", "krun_display"]
+# gpu-gfxstream: Vulkan-only GPU via gfxstream — for macOS
+gpu-gfxstream = ["gpu", "vmm/gpu-gfxstream", "devices/gpu-gfxstream"]
 input = ["krun_input", "vmm/input", "devices/input"]
 virgl_resource_map2 = ["devices/virgl_resource_map2"]
 aws-nitro = ["vmm/aws-nitro", "devices/aws-nitro", "dep:aws-nitro", "dep:nitro-enclaves"]
@@ -47,7 +49,7 @@ kvm-bindings = { version = "0.14", features = ["fam-wrappers"] }
 kvm-ioctls = "0.24"
 aws-nitro = { package = "krun-aws-nitro", version = "=0.1.0-1.18.0", path = "../aws_nitro", optional = true }
 nitro-enclaves = { version = "0.5.0", optional = true }
-vm-memory = { version = "=0.17.1", features = ["backend-mmap"] }
+vm-memory = { version = "0.18.0", features = ["backend-mmap"] }
 
 [target.'cfg(target_os = "windows")'.dependencies]
 windows-sys = { version = "0.61.2", features = [

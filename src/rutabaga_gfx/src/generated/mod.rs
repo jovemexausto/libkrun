@@ -4,4 +4,22 @@
 #![allow(non_snake_case)]
 #![allow(non_upper_case_globals)]
 pub mod virgl_debug_callback_bindings;
+#[cfg(any(feature = "virgl_renderer", target_os = "linux"))]
 pub mod virgl_renderer_bindings;
+#[cfg(not(any(feature = "virgl_renderer", target_os = "linux")))]
+pub mod virgl_renderer_bindings {
+    // Stub: types used by gfxstream.rs on non-Linux without virgl_renderer feature
+    #[allow(non_camel_case_types)]
+    #[repr(C)]
+    pub struct iovec { pub iov_base: *mut ::std::os::raw::c_void, pub iov_len: usize }
+    #[allow(non_camel_case_types)]
+    #[repr(C)]
+    pub struct virgl_box { pub x: u32, pub y: u32, pub z: u32, pub w: u32, pub h: u32, pub d: u32 }
+    #[allow(non_camel_case_types)]
+    #[repr(C)]
+    pub struct virgl_renderer_resource_create_args {
+        pub handle: u32, pub target: u32, pub format: u32, pub bind: u32,
+        pub width: u32, pub height: u32, pub depth: u32, pub array_size: u32,
+        pub last_level: u32, pub nr_samples: u32, pub flags: u32,
+    }
+}

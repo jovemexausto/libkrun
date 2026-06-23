@@ -28,6 +28,7 @@ use crate::renderer_utils::*;
 use crate::rutabaga_core::RutabagaComponent;
 use crate::rutabaga_core::RutabagaContext;
 use crate::rutabaga_core::RutabagaResource;
+use crate::rutabaga_os::AsRawDescriptor;
 use crate::rutabaga_os::FromRawDescriptor;
 use crate::rutabaga_os::IntoRawDescriptor;
 use crate::rutabaga_os::RawDescriptor;
@@ -91,7 +92,7 @@ pub type stream_renderer_fence = RutabagaFence;
 #[allow(non_camel_case_types)]
 pub type stream_renderer_debug = RutabagaDebug;
 
-extern "C" {
+unsafe extern "C" {
     // Entry point for the stream renderer.
     fn stream_renderer_init(
         stream_renderer_params: *mut stream_renderer_param,
@@ -182,6 +183,57 @@ extern "C" {
         name: *const c_char,
         context_init: u32,
     ) -> c_int;
+}
+
+/// Performs a gfxstream TRANSFER_FROM_HOST_3D directly against the global
+/// `stream_renderer_*` singleton, identified by `resource_id` alone.
+///
+/// gfxstream's pipe `TransferFromHost` is a BLOCKING, full-duplex read: it spins
+/// until the per-context RenderThread produces the requested bytes, which in turn
+/// requires the guest's matching writes (`TransferToHost`) to be serviced
+/// concurrently. The virtio-gpu dispatcher must therefore run this *without*
+/// holding any device lock, so a sibling worker can process the feeding writes;
+/// otherwise the single dispatch thread deadlocks against the RenderThread.
+///
+/// Because the underlying `stream_renderer_*` API is a process-global singleton
+/// (no renderer handle) and is internally thread-safe, this is safe to call from
+/// any thread with no `&mut` access to rutabaga state — only the `resource_id`
+/// and transfer geometry are needed (the destination iovecs are tracked
+/// host-side by resource id via ATTACH_BACKING).
+pub fn transfer_read_blocking_by_id(
+    resource_id: u32,
+    ctx_id: u32,
+    transfer: Transfer3D,
+) -> RutabagaResult<()> {
+    if transfer.is_empty() {
+        return Ok(());
+    }
+
+    let mut transfer_box = VirglBox {
+        x: transfer.x,
+        y: transfer.y,
+        z: transfer.z,
+        w: transfer.w,
+        h: transfer.h,
+        d: transfer.d,
+    };
+
+    // Safe: only stack variables of the appropriate type are used; null iovecs
+    // means "transfer into the resource's host-tracked backing" (buf == None).
+    let ret = unsafe {
+        stream_renderer_transfer_read_iov(
+            resource_id,
+            ctx_id,
+            transfer.level,
+            transfer.stride,
+            transfer.layer_stride,
+            &mut transfer_box as *mut VirglBox as *mut stream_renderer_box,
+            transfer.offset,
+            null_mut(),
+            0,
+        )
+    };
+    ret_to_res(ret)
 }
 
 /// The virtio-gpu backend state tracker which supports accelerated rendering.
@@ -313,7 +365,7 @@ impl Gfxstream {
             },
             stream_renderer_param {
                 key: STREAM_RENDERER_PARAM_FENCE_CALLBACK,
-                value: write_context_fence as usize as u64,
+                value: write_context_fence as *const () as usize as u64,
             },
             stream_renderer_param {
                 key: STREAM_RENDERER_PARAM_WIN0_WIDTH,
@@ -326,7 +378,7 @@ impl Gfxstream {
             if use_debug {
                 stream_renderer_param {
                     key: STREAM_RENDERER_PARAM_DEBUG_CALLBACK,
-                    value: gfxstream_debug_callback as usize as u64,
+                    value: gfxstream_debug_callback as *const () as usize as u64,
                 }
             } else {
                 stream_renderer_param {
@@ -457,6 +509,8 @@ impl RutabagaComponent for Gfxstream {
             blob_mem: 0,
             blob_flags: 0,
             map_info: None,
+            #[cfg(target_os = "macos")]
+            map_ptr: None,
             info_2d: None,
             info_3d: None,
             vulkan_info: None,
@@ -630,13 +684,45 @@ impl RutabagaComponent for Gfxstream {
 
         ret_to_res(ret)?;
 
+        // NOTE: `export_blob()` calls into gfxstream's `releaseHandle()`, which is a
+        // one-shot `std::exchange(mFd, invalid)` on the host side -- calling it twice
+        // would hand back an invalid fd on the second call. Compute the handle once and
+        // derive `map_ptr` from it (instead of calling `export_blob` again) so the same
+        // fd backs both fields below.
+        let handle = self.export_blob(resource_id).ok();
+
+        #[cfg(target_os = "macos")]
+        let map_ptr = handle.as_ref().and_then(|h| {
+            if h.handle_type == RUTABAGA_MEM_HANDLE_TYPE_SHM {
+                let addr = unsafe {
+                    libc::mmap(
+                        null_mut(),
+                        resource_create_blob.size as usize,
+                        libc::PROT_READ | libc::PROT_WRITE,
+                        libc::MAP_SHARED,
+                        h.os_handle.as_raw_descriptor(),
+                        0,
+                    )
+                };
+                if addr == libc::MAP_FAILED {
+                    None
+                } else {
+                    Some(addr as u64)
+                }
+            } else {
+                None
+            }
+        });
+
         Ok(RutabagaResource {
             resource_id,
-            handle: self.export_blob(resource_id).ok(),
+            handle,
             blob: true,
             blob_mem: resource_create_blob.blob_mem,
             blob_flags: resource_create_blob.blob_flags,
             map_info: self.map_info(resource_id).ok(),
+            #[cfg(target_os = "macos")]
+            map_ptr,
             info_2d: None,
             info_3d: None,
             vulkan_info: self.vulkan_info(resource_id).ok(),

@@ -17,6 +17,8 @@ use utils::worker_message::WorkerMessage;
 use vm_memory::{GuestAddress, GuestMemoryMmap};
 
 use super::super::descriptor_utils::{Reader, Writer};
+#[cfg(all(target_os = "macos", feature = "gpu-gfxstream"))]
+use super::super::DescriptorChain;
 use super::super::{DeviceQueue, GpuError, Queue as VirtQueue};
 use super::protocol::{
     GpuCommand, GpuResponse, VirtioGpuResult, virtio_gpu_ctrl_hdr, virtio_gpu_mem_entry,
@@ -29,6 +31,21 @@ use crate::virtio::gpu::virtio_gpu::VirtioGpuRing;
 use crate::virtio::{InterruptTransport, VirtioShmRegion};
 use krun_display::DisplayBackend;
 use krun_display::Rect;
+
+/// gfxstream's renderer state holds raw FFI pointers and `dyn` trait objects, so
+/// `VirtioGpu` is not auto-`Send`. The main worker loop owns it exclusively and
+/// only ever touches it locked; the one-shot completer thread spawned per
+/// `TransferFromHost3d` (see `process_queue`) also only locks it briefly, after
+/// its blocking, lock-free read completes, to call `create_fence`/`process_fence`.
+/// Asserting `Send` here is sound because every access is serialized through the
+/// `Mutex`, and the only lock-free path (the blocking transfer itself) never
+/// touches `VirtioGpu` at all -- it calls the gfxstream global singleton by
+/// resource id (see `rutabaga_gfx::transfer_read_blocking_by_id`).
+#[cfg(all(target_os = "macos", feature = "gpu-gfxstream"))]
+struct SharedVirtioGpu(Arc<Mutex<VirtioGpu>>);
+#[cfg(all(target_os = "macos", feature = "gpu-gfxstream"))]
+// SAFETY: see SharedVirtioGpu doc comment.
+unsafe impl Send for SharedVirtioGpu {}
 
 pub struct Worker {
     control_evt: EventFd,
@@ -87,6 +104,41 @@ impl Worker {
             .unwrap();
     }
 
+    #[cfg(all(target_os = "macos", feature = "gpu-gfxstream"))]
+    fn work(mut self) {
+        // gfxstream's pipe TRANSFER_FROM_HOST_3D is a blocking, full-duplex read
+        // that only completes once the guest's matching TRANSFER_TO_HOST_3D writes
+        // (queued right after it) are serviced by this same dispatcher. Handling it
+        // in-line like every other command deadlocks: this thread would block
+        // waiting for input that only it can deliver. So this command alone is
+        // deferred to a one-shot helper thread (see `process_queue`); every other
+        // command stays on this single thread, in the queue's original order,
+        // exactly as before.
+        let virtio_gpu = VirtioGpu::new_gfxstream(
+            self.mem.clone(),
+            self.control_queue.clone(),
+            self.interrupt.clone(),
+            self.map_sender.clone(),
+            self.export_table.take(),
+            self.displays.clone(),
+            self.display_backend,
+        );
+        let virtio_gpu = Arc::new(Mutex::new(virtio_gpu));
+
+        loop {
+            if let Err(e) = self.control_evt.read() {
+                error!("Failed to read control_evt: {e:?}");
+                continue;
+            }
+            if self.process_queue(&virtio_gpu, &self.control_queue.clone())
+                && let Err(e) = self.interrupt.try_signal_used_queue()
+            {
+                error!("Error signaling queue: {e:?}");
+            }
+        }
+    }
+
+    #[cfg(not(all(target_os = "macos", feature = "gpu-gfxstream")))]
     fn work(mut self) {
         let mut virtio_gpu = VirtioGpu::new(
             self.mem.clone(),
@@ -346,6 +398,7 @@ impl Worker {
         }
     }
 
+    #[cfg(not(all(target_os = "macos", feature = "gpu-gfxstream")))]
     fn process_queue(
         &mut self,
         virtio_gpu: &mut VirtioGpu,
@@ -452,5 +505,272 @@ impl Worker {
 
         debug!("gpu: process_queue exit");
         used_any
+    }
+
+    /// Same as the generic `process_queue`, except `TransferFromHost3d` is
+    /// deferred to a one-shot helper thread instead of being processed in-line.
+    ///
+    /// gfxstream's pipe `TransferFromHost` blocks until the per-context
+    /// RenderThread on the host produces the requested bytes, which itself
+    /// requires the guest's `TransferToHost3d` writes -- queued right behind this
+    /// command -- to be serviced concurrently. Running it in-line on this single
+    /// dispatch thread would block the very thread that needs to drain those
+    /// feeding writes, deadlocking against the RenderThread. Every other command
+    /// is handled exactly as in `process_queue`, on this thread, in queue order;
+    /// only the blocking read itself is offloaded.
+    #[cfg(all(target_os = "macos", feature = "gpu-gfxstream"))]
+    fn process_queue(
+        &mut self,
+        virtio_gpu: &Arc<Mutex<VirtioGpu>>,
+        control_queue: &Arc<Mutex<VirtQueue>>,
+    ) -> bool {
+        let mut used_any = false;
+        let mem = self.mem.clone();
+
+        loop {
+            let head = control_queue.lock().unwrap().pop(&mem);
+
+            let Some(head) = head else { break };
+
+            let mut reader = Reader::new(&mem, head.clone())
+                .map_err(GpuError::QueueReader)
+                .unwrap();
+
+            let Ok((hdr, cmd)) = GpuCommand::decode(&mut reader) else {
+                debug!("descriptor decode error");
+                continue;
+            };
+
+            if let GpuCommand::TransferFromHost3d(info) = cmd {
+                let transfer = Transfer3D {
+                    x: info.box_.x,
+                    y: info.box_.y,
+                    z: info.box_.z,
+                    w: info.box_.w,
+                    h: info.box_.h,
+                    d: info.box_.d,
+                    level: info.level,
+                    stride: info.stride,
+                    layer_stride: info.layer_stride,
+                    offset: info.offset,
+                };
+                let resource_id = info.resource_id;
+                let desc_table = control_queue.lock().unwrap().desc_table;
+                let queue_size = control_queue.lock().unwrap().actual_size();
+                let index = head.index;
+                let deferred_mem = self.mem.clone();
+                let control_queue = control_queue.clone();
+                let interrupt = self.interrupt.clone();
+                let virtio_gpu = SharedVirtioGpu(virtio_gpu.clone());
+
+                thread::Builder::new()
+                    .name("gpu xfer".into())
+                    .spawn(move || {
+                        // Call a named function with the whole `SharedVirtioGpu`
+                        // wrapper as a single argument, and destructure it inside
+                        // that function rather than here: 2021-edition disjoint
+                        // closure capture treats a tuple-struct destructure
+                        // pattern as a field projection (`virtio_gpu.0`) for
+                        // capture-analysis purposes, which would capture the
+                        // non-`Send` inner `Arc` directly and bypass the wrapper's
+                        // `unsafe impl Send`.
+                        Self::complete_deferred_transfer_read(
+                            virtio_gpu,
+                            control_queue,
+                            deferred_mem,
+                            interrupt,
+                            desc_table,
+                            queue_size,
+                            index,
+                            hdr,
+                            resource_id,
+                            hdr.ctx_id,
+                            transfer,
+                        )
+                    })
+                    .unwrap();
+
+                // Don't wait for it: keep draining the queue immediately so the
+                // TransferToHost3d writes the deferred read is blocked on get
+                // serviced without delay.
+                continue;
+            }
+
+            let mut writer = Writer::new(&mem, head.clone())
+                .map_err(GpuError::QueueWriter)
+                .unwrap();
+
+            let mut vg = virtio_gpu.lock().unwrap();
+            let resp = self.process_gpu_command(&mut vg, &mem, hdr, cmd, &mut reader);
+            drop(vg);
+
+            let mut gpu_response = match resp {
+                Ok(gpu_response) => gpu_response,
+                Err(gpu_response) => {
+                    debug!("{cmd:?} -> {gpu_response:?}");
+                    gpu_response
+                }
+            };
+
+            let mut add_to_queue = true;
+            let mut len = 0;
+
+            if writer.available_bytes() != 0 {
+                let mut fence_id = 0;
+                let mut ctx_id = 0;
+                let mut flags = 0;
+                let mut ring_idx = 0;
+                if hdr.flags & VIRTIO_GPU_FLAG_FENCE != 0 {
+                    flags = hdr.flags;
+                    fence_id = hdr.fence_id;
+                    ctx_id = hdr.ctx_id;
+                    ring_idx = hdr.ring_idx;
+
+                    let fence = RutabagaFence {
+                        flags,
+                        fence_id,
+                        ctx_id,
+                        ring_idx,
+                    };
+                    gpu_response = match virtio_gpu.lock().unwrap().create_fence(fence) {
+                        Ok(_) => gpu_response,
+                        Err(fence_resp) => {
+                            warn!("create_fence {fence_id} -> {fence_resp:?}");
+                            fence_resp
+                        }
+                    };
+                }
+
+                match gpu_response.encode(flags, fence_id, ctx_id, ring_idx, &mut writer) {
+                    Ok(l) => len = l,
+                    Err(e) => debug!("ctrl queue response encode error: {e:?}"),
+                }
+
+                if flags & VIRTIO_GPU_FLAG_FENCE != 0 {
+                    let ring = match flags & VIRTIO_GPU_FLAG_INFO_RING_IDX {
+                        0 => VirtioGpuRing::Global,
+                        _ => VirtioGpuRing::ContextSpecific { ctx_id, ring_idx },
+                    };
+
+                    add_to_queue = virtio_gpu
+                        .lock()
+                        .unwrap()
+                        .process_fence(ring, fence_id, head.index, len);
+                }
+            }
+
+            if add_to_queue {
+                if let Err(e) = control_queue.lock().unwrap().add_used(&mem, head.index, len) {
+                    error!("failed to add used elements to the queue: {e:?}");
+                }
+                used_any = true;
+            }
+        }
+
+        debug!("gpu: process_queue exit");
+        used_any
+    }
+
+    /// Runs entirely on the one-shot helper thread spawned for a deferred
+    /// `TransferFromHost3d`: performs the blocking, lock-free gfxstream read,
+    /// then completes the virtio-gpu descriptor exactly as the inline path would
+    /// have (fence handling, response encode, add_used, interrupt).
+    #[cfg(all(target_os = "macos", feature = "gpu-gfxstream"))]
+    #[allow(clippy::too_many_arguments)]
+    fn complete_deferred_transfer_read(
+        virtio_gpu: SharedVirtioGpu,
+        control_queue: Arc<Mutex<VirtQueue>>,
+        mem: GuestMemoryMmap,
+        interrupt: InterruptTransport,
+        desc_table: GuestAddress,
+        queue_size: u16,
+        index: u16,
+        hdr: virtio_gpu_ctrl_hdr,
+        resource_id: u32,
+        ctx_id: u32,
+        transfer: Transfer3D,
+    ) {
+        let SharedVirtioGpu(virtio_gpu) = virtio_gpu;
+        let mut gpu_response = match rutabaga_gfx::transfer_read_blocking_by_id(
+            resource_id,
+            ctx_id,
+            transfer,
+        ) {
+            Ok(()) => GpuResponse::OkNoData,
+            Err(e) => {
+                warn!("deferred transfer_read({resource_id}) failed: {e:?}");
+                GpuResponse::ErrUnspec
+            }
+        };
+
+        let Some(chain) = DescriptorChain::checked_new(&mem, desc_table, queue_size, index) else {
+            error!("deferred transfer_read: failed to rebuild descriptor chain for index {index}");
+            return;
+        };
+        let mut writer = match Writer::new(&mem, chain) {
+            Ok(w) => w,
+            Err(e) => {
+                error!("deferred transfer_read: writer rebuild failed: {e:?}");
+                return;
+            }
+        };
+
+        let mut fence_id = 0;
+        let mut resp_ctx_id = 0;
+        let mut flags = 0;
+        let mut ring_idx = 0;
+        let mut len = 0;
+
+        if writer.available_bytes() != 0 {
+            if hdr.flags & VIRTIO_GPU_FLAG_FENCE != 0 {
+                flags = hdr.flags;
+                fence_id = hdr.fence_id;
+                resp_ctx_id = hdr.ctx_id;
+                ring_idx = hdr.ring_idx;
+
+                let fence = RutabagaFence {
+                    flags,
+                    fence_id,
+                    ctx_id: resp_ctx_id,
+                    ring_idx,
+                };
+                gpu_response = match virtio_gpu.lock().unwrap().create_fence(fence) {
+                    Ok(_) => gpu_response,
+                    Err(fence_resp) => {
+                        warn!("deferred create_fence {fence_id} -> {fence_resp:?}");
+                        fence_resp
+                    }
+                };
+            }
+
+            match gpu_response.encode(flags, fence_id, resp_ctx_id, ring_idx, &mut writer) {
+                Ok(l) => len = l,
+                Err(e) => debug!("deferred ctrl queue response encode error: {e:?}"),
+            }
+        }
+
+        let mut add_to_queue = true;
+        if flags & VIRTIO_GPU_FLAG_FENCE != 0 {
+            let ring = match flags & VIRTIO_GPU_FLAG_INFO_RING_IDX {
+                0 => VirtioGpuRing::Global,
+                _ => VirtioGpuRing::ContextSpecific {
+                    ctx_id: resp_ctx_id,
+                    ring_idx,
+                },
+            };
+            add_to_queue = virtio_gpu
+                .lock()
+                .unwrap()
+                .process_fence(ring, fence_id, index, len);
+        }
+
+        if add_to_queue {
+            if let Err(e) = control_queue.lock().unwrap().add_used(&mem, index, len) {
+                error!("deferred: failed to add used elements to the queue: {e:?}");
+            }
+            if let Err(e) = interrupt.try_signal_used_queue() {
+                error!("deferred: error signaling queue: {e:?}");
+            }
+        }
     }
 }

@@ -134,6 +134,21 @@ impl MMIODeviceManager {
     }
 
     #[cfg(target_arch = "aarch64")]
+    pub fn add_device_to_cmdline(
+        &mut self,
+        cmdline: &mut kernel_cmdline::Cmdline,
+        mmio_base: u64,
+        irq: u32,
+    ) -> Result<()> {
+        cmdline
+            .insert(
+                "virtio_mmio.device",
+                &format!("{}K@0x{:08x}:{}", MMIO_LEN / 1024, mmio_base, irq),
+            )
+            .map_err(Error::Cmdline)
+    }
+
+    #[cfg(target_arch = "aarch64")]
     /// Register an early console at some MMIO address.
     pub fn register_mmio_serial(
         &mut self,
