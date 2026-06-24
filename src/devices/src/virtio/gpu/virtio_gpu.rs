@@ -326,18 +326,23 @@ impl VirtioGpu {
         // initialize renderer.") because the GLES decoder it would need
         // isn't compiled in.
         //
-        // A `-Ddecoders=vulkan,gles,composer` build exists experimentally
-        // (see capivara-gfxstream-gles-host-build memory note) and does
-        // initialize with use_egl(false)+use_gles(true) -- EGL_BIT maps to
-        // gfxstream's `EglOnEgl` feature, which would otherwise route the
-        // GLES translator through egl_os_api_egl.cpp's dlopen of a host
-        // libEGL.so/libGLESv2.so that doesn't exist on macOS; EglOnEgl off
-        // picks the native egl_os_api_darwin.cpp path instead. But that path
-        // is GLSL ES 3.0 via Apple's internal ANGLE-over-Metal shim
-        // (GL_VENDOR "Google (Apple)"), and gfxstream's own internal blit
-        // shader (texture_draw.cpp) fails to compile under it with an empty
-        // info log regardless of #version pragma -- not yet root-caused, so
-        // that build isn't wired up as the default here.
+        // A `-Ddecoders=vulkan,gles,composer` build exists and, as of
+        // 2026-06-24, the GLES decoder's shader-compile blocker is fixed and
+        // boot-validated (use_egl(false)+use_gles(true) against that build
+        // constructs and compiles gfxstream's internal blit shader
+        // (texture_draw.cpp) successfully on macOS -- see
+        // capivara-gles-shader-translator-missing memory note and
+        // patches/README.md gfxstream 0006-0009). Two real bugs were behind
+        // it: vendor/gfxstream/third_party/angle's Bazel `translator` target
+        // never defined ANGLE_ENABLE_GLSL (so sh::ConstructCompiler() always
+        // returned null for any GLSL/ESSL output, the actual "Could not
+        // compile shader" cause -- nothing to do with Apple's ANGLE-over-
+        // Metal runtime, that hypothesis was investigated and disproved),
+        // plus the angle_shader_translator C ABI itself never being
+        // implemented anywhere (now in ShaderTranslator.{h,cpp}). Still
+        // defaulting to false here because the GLES decoder hasn't been
+        // exercised end-to-end against a real Android guest (only a minimal
+        // /bin/sh root) -- flip deliberately, not silently, once that's done.
         let builder = RutabagaBuilder::new(
             rutabaga_gfx::RutabagaComponentType::Gfxstream,
             0, // virgl_flags — unused by gfxstream component
