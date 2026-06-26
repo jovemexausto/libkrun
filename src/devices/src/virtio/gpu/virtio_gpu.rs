@@ -339,10 +339,23 @@ impl VirtioGpu {
         // compile shader" cause -- nothing to do with Apple's ANGLE-over-
         // Metal runtime, that hypothesis was investigated and disproved),
         // plus the angle_shader_translator C ABI itself never being
-        // implemented anywhere (now in ShaderTranslator.{h,cpp}). Still
-        // defaulting to false here because the GLES decoder hasn't been
-        // exercised end-to-end against a real Android guest (only a minimal
-        // /bin/sh root) -- flip deliberately, not silently, once that's done.
+        // implemented anywhere (now in ShaderTranslator.{h,cpp}).
+        //
+        // use_gles(true) is now the validated default: a real Android guest
+        // boot (composer3/RanchuHwc + SurfaceFlinger) confirmed
+        // render_control.cpp/renderControl_dec only get compiled into
+        // libgfxstream_backend when use_gles is on (meson.build gates both
+        // behind `if use_gles`/`if use_composer`), so a Vulkan-only build
+        // leaves RanchuHwc's "pipe:opengles" host-extension query
+        // (HostConnection::rcEncoder() -> rcGetHostExtensionsString)
+        // permanently unanswered -- composer hangs, system_server's Watchdog
+        // kills it, zygote loops every ~70s. Combined with
+        // androidboot.hardware.gralloc=minigbm (crates/capy/src/main.rs;
+        // GoldfishGralloc otherwise resolves to GRALLOC_TYPE_RANCHU, a
+        // null-pointer SIGSEGV in getFormat() when SurfaceFlinger imports an
+        // AHardwareBuffer), SurfaceFlinger ran stable for 800s+ of continuous
+        // boot with zero crashes. See README.md "Estado atual" and
+        // patches/README.md for the full chain.
         let builder = RutabagaBuilder::new(
             rutabaga_gfx::RutabagaComponentType::Gfxstream,
             0, // virgl_flags — unused by gfxstream component
@@ -351,7 +364,7 @@ impl VirtioGpu {
         .set_display_width(display_width)
         .set_display_height(display_height)
         .set_use_egl(false)
-        .set_use_gles(false)
+        .set_use_gles(true)
         .set_use_glx(false)
         .set_use_surfaceless(false)
         .set_use_vulkan(true)
