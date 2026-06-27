@@ -47,6 +47,89 @@ struct SharedVirtioGpu(Arc<Mutex<VirtioGpu>>);
 // SAFETY: see SharedVirtioGpu doc comment.
 unsafe impl Send for SharedVirtioGpu {}
 
+/// Tracks deferred `TransferFromHost3d` reads still in flight, keyed by resource id.
+///
+/// A deferred read (see `process_queue`) runs on its own thread and transfers into
+/// the gfxstream resource's host-tracked iov/linear backing. That backing is a pair
+/// of `std::vector`s inside `VirtioGpuResource` (see gfxstream `AttachIov`/`DetachIov`):
+/// `ResourceAttachBacking`/`ResourceDetachBacking`/`ResourceUnref` clear and reallocate
+/// (or free) them. If the dispatch thread services one of those while a deferred read on
+/// the same resource is mid-transfer, the read's `mLinear.data()` / `mIovs[i].iov_base`
+/// pointers dangle -> SIGSEGV in `VirtioGpuResource::TransferWithIov`. We can't hold a
+/// lock across the deferred read's blocking pipe wait (that would re-introduce the
+/// dispatcher deadlock `process_queue` exists to avoid), but these three lifecycle
+/// commands do NOT feed the host RenderThread, so making the dispatch thread simply wait
+/// for in-flight reads on that one resource to drain before running them is deadlock-free.
+#[cfg(all(target_os = "macos", feature = "gpu-gfxstream"))]
+mod deferred_guard {
+    use std::collections::HashMap;
+    use std::sync::{Condvar, Mutex, OnceLock};
+
+    fn state() -> &'static (Mutex<HashMap<u32, u32>>, Condvar) {
+        static INFLIGHT: OnceLock<(Mutex<HashMap<u32, u32>>, Condvar)> = OnceLock::new();
+        INFLIGHT.get_or_init(|| (Mutex::new(HashMap::new()), Condvar::new()))
+    }
+
+    /// Mark a deferred read on `resource_id` as started (call on the dispatch thread,
+    /// before spawning the read, so the count is visible before the dispatch thread
+    /// moves on to later commands).
+    pub fn begin(resource_id: u32) {
+        let (lock, _) = state();
+        *lock.lock().unwrap().entry(resource_id).or_insert(0) += 1;
+    }
+
+    /// Mark the deferred read on `resource_id` as finished (call on the read thread).
+    pub fn end(resource_id: u32) {
+        let (lock, cvar) = state();
+        let mut map = lock.lock().unwrap();
+        if let Some(c) = map.get_mut(&resource_id) {
+            *c = c.saturating_sub(1);
+            if *c == 0 {
+                map.remove(&resource_id);
+            }
+        }
+        cvar.notify_all();
+    }
+
+    /// Block until no deferred read is in flight for `resource_id`.
+    pub fn wait_idle(resource_id: u32) {
+        let (lock, cvar) = state();
+        let mut map = lock.lock().unwrap();
+        while map.get(&resource_id).copied().unwrap_or(0) > 0 {
+            map = cvar.wait(map).unwrap();
+        }
+    }
+
+    /// Block until there are no deferred reads in flight at all, for any resource.
+    ///
+    /// `transfer_read_blocking_by_id` is a free, by-id rutabaga_gfx call that does
+    /// NOT take the `Arc<Mutex<VirtioGpu>>` lock the dispatch thread normally holds
+    /// while running any other command -- deliberate (0007), so the deferred read's
+    /// blocking pipe wait never stalls the dispatch thread. But every gfxstream
+    /// frontend entry point it reaches (`mResources.find()` and friends) touches
+    /// the SAME `std::unordered_map` the dispatch thread's *locked* path also
+    /// touches for resource-affecting commands -- e.g. `ResourceFlush`'s inline
+    /// `flush_resource` -> `read_2d_resource` -> `transfer_read` calls
+    /// `transferReadIov` directly, with no Rust-side lock in between. Concurrent
+    /// `unordered_map::find()` (deferred thread) vs. insert/erase/move-assign
+    /// (dispatch thread, for ANY resource id, not just the one being read) is a
+    /// data race per the C++ object model regardless of whether the ids involved
+    /// match -- observed: SIGSEGV in TransferWithIov on the *dispatch* thread for
+    /// a resource with no in-flight deferred read of its own. A per-resource guard
+    /// can't catch this; only draining every in-flight deferred read first can.
+    /// Never call this before `TransferToHost3d`: deferred reads only depend on
+    /// that command (and on their own, always-running per-context RenderThread,
+    /// which this doesn't block) to make progress, so waiting before anything
+    /// else here doesn't risk the dispatcher deadlock 0007 avoids.
+    pub fn wait_idle_all() {
+        let (lock, cvar) = state();
+        let mut map = lock.lock().unwrap();
+        while !map.is_empty() {
+            map = cvar.wait(map).unwrap();
+        }
+    }
+}
+
 pub struct Worker {
     control_evt: EventFd,
     control_queue: Arc<Mutex<VirtQueue>>,
@@ -563,6 +646,23 @@ impl Worker {
                 let interrupt = self.interrupt.clone();
                 let virtio_gpu = SharedVirtioGpu(virtio_gpu.clone());
 
+                // RanchuHwc can pipeline several TransferFromHost3d commands for the
+                // *same* resource back to back. Each one used to spawn its own
+                // one-shot thread with no serialization against the others, so two
+                // deferred reads for the same resource_id could run concurrently,
+                // both touching that resource's mIovs/mLinear at once -- a real data
+                // race (observed: SIGSEGV in TransferWithIov from corrupted iov_base).
+                // Drain any prior in-flight read on this exact resource before
+                // starting a new one; reads on *different* resources still run
+                // concurrently, so this doesn't reintroduce the dispatcher deadlock
+                // that spawning was meant to avoid.
+                deferred_guard::wait_idle(resource_id);
+
+                // Mark this read in flight *before* spawning, so a later
+                // attach/detach/unref on the same resource (serviced by this
+                // dispatch thread while the read runs) observes it and waits.
+                deferred_guard::begin(resource_id);
+
                 thread::Builder::new()
                     .name("gpu xfer".into())
                     .spawn(move || {
@@ -586,7 +686,8 @@ impl Worker {
                             resource_id,
                             hdr.ctx_id,
                             transfer,
-                        )
+                        );
+                        deferred_guard::end(resource_id);
                     })
                     .unwrap();
 
@@ -594,6 +695,17 @@ impl Worker {
                 // TransferToHost3d writes the deferred read is blocked on get
                 // serviced without delay.
                 continue;
+            }
+
+            // Every command except TransferToHost3d waits for in-flight deferred
+            // reads to drain first -- see wait_idle_all's doc comment. (Narrowing
+            // this to just ResourceFlush's resource id was tried and is NOT
+            // enough: the race is at the `std::unordered_map` level inside
+            // gfxstream's VirtioGpuFrontend, not the per-resource iov/linear
+            // vectors, so it reproduces the same SIGSEGV even when the racing
+            // resource ids differ.)
+            if !matches!(cmd, GpuCommand::TransferToHost3d(_)) {
+                deferred_guard::wait_idle_all();
             }
 
             let mut writer = Writer::new(&mem, head.clone())
