@@ -92,39 +92,18 @@ mod deferred_guard {
     }
 
     /// Block until no deferred read is in flight for `resource_id`.
+    ///
+    /// Used only for resource-lifecycle commands (attach/detach/unref/create) on
+    /// the same resource, so a deferred read never has its iov/linear backing
+    /// reallocated mid-transfer. Scoped per-resource on purpose: a global
+    /// "wait for all in-flight reads" was tried and deadlocked, because it also
+    /// blocked CmdSubmit3d / ASG context-ping commands that the host's ASG render
+    /// thread needs serviced to drain the guest's Vulkan command ring -- and a
+    /// deferred read can itself be waiting on that ring.
     pub fn wait_idle(resource_id: u32) {
         let (lock, cvar) = state();
         let mut map = lock.lock().unwrap();
         while map.get(&resource_id).copied().unwrap_or(0) > 0 {
-            map = cvar.wait(map).unwrap();
-        }
-    }
-
-    /// Block until there are no deferred reads in flight at all, for any resource.
-    ///
-    /// `transfer_read_blocking_by_id` is a free, by-id rutabaga_gfx call that does
-    /// NOT take the `Arc<Mutex<VirtioGpu>>` lock the dispatch thread normally holds
-    /// while running any other command -- deliberate (0007), so the deferred read's
-    /// blocking pipe wait never stalls the dispatch thread. But every gfxstream
-    /// frontend entry point it reaches (`mResources.find()` and friends) touches
-    /// the SAME `std::unordered_map` the dispatch thread's *locked* path also
-    /// touches for resource-affecting commands -- e.g. `ResourceFlush`'s inline
-    /// `flush_resource` -> `read_2d_resource` -> `transfer_read` calls
-    /// `transferReadIov` directly, with no Rust-side lock in between. Concurrent
-    /// `unordered_map::find()` (deferred thread) vs. insert/erase/move-assign
-    /// (dispatch thread, for ANY resource id, not just the one being read) is a
-    /// data race per the C++ object model regardless of whether the ids involved
-    /// match -- observed: SIGSEGV in TransferWithIov on the *dispatch* thread for
-    /// a resource with no in-flight deferred read of its own. A per-resource guard
-    /// can't catch this; only draining every in-flight deferred read first can.
-    /// Never call this before `TransferToHost3d`: deferred reads only depend on
-    /// that command (and on their own, always-running per-context RenderThread,
-    /// which this doesn't block) to make progress, so waiting before anything
-    /// else here doesn't risk the dispatcher deadlock 0007 avoids.
-    pub fn wait_idle_all() {
-        let (lock, cvar) = state();
-        let mut map = lock.lock().unwrap();
-        while !map.is_empty() {
             map = cvar.wait(map).unwrap();
         }
     }
@@ -697,15 +676,33 @@ impl Worker {
                 continue;
             }
 
-            // Every command except TransferToHost3d waits for in-flight deferred
-            // reads to drain first -- see wait_idle_all's doc comment. (Narrowing
-            // this to just ResourceFlush's resource id was tried and is NOT
-            // enough: the race is at the `std::unordered_map` level inside
-            // gfxstream's VirtioGpuFrontend, not the per-resource iov/linear
-            // vectors, so it reproduces the same SIGSEGV even when the racing
-            // resource ids differ.)
-            if !matches!(cmd, GpuCommand::TransferToHost3d(_)) {
-                deferred_guard::wait_idle_all();
+            // Resource-lifecycle commands must wait for any in-flight deferred
+            // read on THAT SAME resource to drain first, so the read never sees
+            // its iov/linear backing reallocated mid-transfer. Scope this to the
+            // affected resource id only -- NOT a global drain. A global
+            // wait-for-all (tried earlier) deadlocks: it would also block
+            // CmdSubmit3d / ASG context-ping commands, which the host's ASG
+            // render thread needs serviced to drain the guest's Vulkan command
+            // ring -- and a deferred read can itself be waiting on exactly that
+            // ring to make progress. The map-level race the global drain was
+            // meant to cover is handled structurally on the gfxstream side now
+            // (mResources is shared_ptr + mutex), and the SIGSEGV that motivated
+            // the global drain turned out to be an unrelated dangling display
+            // pointer (fixed in crates/capy), not a deferred-read race at all.
+            match &cmd {
+                GpuCommand::ResourceAttachBacking(info) => {
+                    deferred_guard::wait_idle(info.resource_id)
+                }
+                GpuCommand::ResourceDetachBacking(info) => {
+                    deferred_guard::wait_idle(info.resource_id)
+                }
+                GpuCommand::ResourceUnref(info) => deferred_guard::wait_idle(info.resource_id),
+                GpuCommand::ResourceCreate2d(info) => deferred_guard::wait_idle(info.resource_id),
+                GpuCommand::ResourceCreate3d(info) => deferred_guard::wait_idle(info.resource_id),
+                GpuCommand::ResourceCreateBlob(info) => {
+                    deferred_guard::wait_idle(info.resource_id)
+                }
+                _ => {}
             }
 
             let mut writer = Writer::new(&mem, head.clone())
