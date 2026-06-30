@@ -65,29 +65,71 @@ mod deferred_guard {
     use std::collections::HashMap;
     use std::sync::{Condvar, Mutex, OnceLock};
 
-    fn state() -> &'static (Mutex<HashMap<u32, u32>>, Condvar) {
-        static INFLIGHT: OnceLock<(Mutex<HashMap<u32, u32>>, Condvar)> = OnceLock::new();
-        INFLIGHT.get_or_init(|| (Mutex::new(HashMap::new()), Condvar::new()))
+    #[derive(Default)]
+    struct State {
+        /// In-flight deferred reads per resource (begun, not yet ended). Used by
+        /// `wait_idle` for resource-lifecycle commands.
+        count: HashMap<u32, u32>,
+        /// Next FIFO ticket to hand out per resource.
+        next_ticket: HashMap<u32, u64>,
+        /// Ticket currently allowed to run per resource. A read runs only when its
+        /// ticket == served[resource].
+        served: HashMap<u32, u64>,
     }
 
-    /// Mark a deferred read on `resource_id` as started (call on the dispatch thread,
-    /// before spawning the read, so the count is visible before the dispatch thread
-    /// moves on to later commands).
-    pub fn begin(resource_id: u32) {
+    fn state() -> &'static (Mutex<State>, Condvar) {
+        static S: OnceLock<(Mutex<State>, Condvar)> = OnceLock::new();
+        S.get_or_init(|| (Mutex::new(State::default()), Condvar::new()))
+    }
+
+    /// Mark a deferred read on `resource_id` as started and return its FIFO ticket.
+    /// Call on the dispatch thread, before spawning the read, so the count is
+    /// visible before the dispatch thread moves on to later commands.
+    pub fn begin(resource_id: u32) -> u64 {
         let (lock, _) = state();
-        *lock.lock().unwrap().entry(resource_id).or_insert(0) += 1;
+        let mut s = lock.lock().unwrap();
+        *s.count.entry(resource_id).or_insert(0) += 1;
+        let t = s.next_ticket.entry(resource_id).or_insert(0);
+        let ticket = *t;
+        *t += 1;
+        ticket
     }
 
-    /// Mark the deferred read on `resource_id` as finished (call on the read thread).
+    /// Block (on the read thread, NOT the dispatch thread) until it is this read's
+    /// turn, so reads on the same resource run one at a time in submission order
+    /// and never touch its iov/linear backing concurrently. Crucially this serializes
+    /// WITHOUT blocking the dispatch thread, which must keep draining the queue to
+    /// service the TransferToHost3d writes that feed the in-flight read -- blocking
+    /// the dispatcher here (the previous `wait_idle` at the defer site did) deadlocks:
+    /// a second same-resource read would stall the dispatcher before it reaches the
+    /// write the first read is waiting on.
+    pub fn wait_turn(resource_id: u32, ticket: u64) {
+        let (lock, cvar) = state();
+        let mut s = lock.lock().unwrap();
+        while *s.served.get(&resource_id).unwrap_or(&0) != ticket {
+            s = cvar.wait(s).unwrap();
+        }
+    }
+
+    /// Mark the deferred read on `resource_id` as finished (call on the read thread,
+    /// after the transfer). Advances the served ticket so the next same-resource read
+    /// may run, and drops the in-flight count.
     pub fn end(resource_id: u32) {
         let (lock, cvar) = state();
-        let mut map = lock.lock().unwrap();
-        if let Some(c) = map.get_mut(&resource_id) {
+        let mut s = lock.lock().unwrap();
+        if let Some(c) = s.count.get_mut(&resource_id) {
             *c = c.saturating_sub(1);
             if *c == 0 {
-                map.remove(&resource_id);
+                // No reads left for this resource: reset its ticketing so a future
+                // burst starts cleanly at 0.
+                s.count.remove(&resource_id);
+                s.next_ticket.remove(&resource_id);
+                s.served.remove(&resource_id);
+                cvar.notify_all();
+                return;
             }
         }
+        *s.served.entry(resource_id).or_insert(0) += 1;
         cvar.notify_all();
     }
 
@@ -95,16 +137,14 @@ mod deferred_guard {
     ///
     /// Used only for resource-lifecycle commands (attach/detach/unref/create) on
     /// the same resource, so a deferred read never has its iov/linear backing
-    /// reallocated mid-transfer. Scoped per-resource on purpose: a global
-    /// "wait for all in-flight reads" was tried and deadlocked, because it also
-    /// blocked CmdSubmit3d / ASG context-ping commands that the host's ASG render
-    /// thread needs serviced to drain the guest's Vulkan command ring -- and a
-    /// deferred read can itself be waiting on that ring.
+    /// reallocated mid-transfer. These commands do NOT feed the host RenderThread,
+    /// so waiting for them on the dispatch thread is deadlock-free (unlike the
+    /// same-resource read case, which is serialized via wait_turn instead).
     pub fn wait_idle(resource_id: u32) {
         let (lock, cvar) = state();
-        let mut map = lock.lock().unwrap();
-        while map.get(&resource_id).copied().unwrap_or(0) > 0 {
-            map = cvar.wait(map).unwrap();
+        let mut s = lock.lock().unwrap();
+        while s.count.get(&resource_id).copied().unwrap_or(0) > 0 {
+            s = cvar.wait(s).unwrap();
         }
     }
 }
@@ -360,7 +400,6 @@ impl Worker {
                     layer_stride: info.layer_stride,
                     offset: info.offset,
                 };
-
                 virtio_gpu.transfer_write(ctx_id, resource_id, transfer)
             }
             GpuCommand::TransferFromHost3d(info) => {
@@ -635,16 +674,19 @@ impl Worker {
                 // starting a new one; reads on *different* resources still run
                 // concurrently, so this doesn't reintroduce the dispatcher deadlock
                 // that spawning was meant to avoid.
-                deferred_guard::wait_idle(resource_id);
-
-                // Mark this read in flight *before* spawning, so a later
-                // attach/detach/unref on the same resource (serviced by this
-                // dispatch thread while the read runs) observes it and waits.
-                deferred_guard::begin(resource_id);
+                // Take a FIFO ticket and mark the read in flight *before* spawning,
+                // so (a) a later attach/detach/unref on the same resource serviced by
+                // this dispatch thread observes the in-flight count and waits, and
+                // (b) same-resource reads run in submission order. We do NOT block the
+                // dispatch thread here: the spawned read waits for its turn itself, so
+                // the dispatcher keeps draining and services the TransferToHost3d
+                // writes that feed the in-flight read (blocking here deadlocked).
+                let ticket = deferred_guard::begin(resource_id);
 
                 thread::Builder::new()
                     .name("gpu xfer".into())
                     .spawn(move || {
+                        deferred_guard::wait_turn(resource_id, ticket);
                         // Call a named function with the whole `SharedVirtioGpu`
                         // wrapper as a single argument, and destructure it inside
                         // that function rather than here: 2021-edition disjoint
