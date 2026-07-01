@@ -718,47 +718,22 @@ impl Worker {
                 continue;
             }
 
-            // Resource-lifecycle commands must wait for any in-flight deferred
-            // read on THAT SAME resource to drain first, so the read never sees
-            // its iov/linear backing reallocated mid-transfer. Scope this to the
-            // affected resource id only -- NOT a global drain. A global
-            // wait-for-all (tried earlier) deadlocks: it would also block
-            // CmdSubmit3d / ASG context-ping commands, which the host's ASG
-            // render thread needs serviced to drain the guest's Vulkan command
-            // ring -- and a deferred read can itself be waiting on exactly that
-            // ring to make progress. The map-level race the global drain was
-            // meant to cover is handled structurally on the gfxstream side now
-            // (mResources is shared_ptr + mutex), and the SIGSEGV that motivated
-            // the global drain turned out to be an unrelated dangling display
-            // pointer (fixed in crates/capy), not a deferred-read race at all.
-            match &cmd {
-                GpuCommand::ResourceAttachBacking(info) => {
-                    deferred_guard::wait_idle(info.resource_id)
-                }
-                GpuCommand::ResourceDetachBacking(info) => {
-                    deferred_guard::wait_idle(info.resource_id)
-                }
-                GpuCommand::ResourceUnref(info) => deferred_guard::wait_idle(info.resource_id),
-                // CtxDetachResource -> VirtioGpuResource::DetachFromContext sets
-                // mHostPipe = nullptr, freeing the context's RenderThreadPipe/RenderChannel.
-                // This used to wait_idle so an in-flight deferred TransferFromHost3d read on
-                // this resource wouldn't dereference the freed channel. But that wait_idle
-                // DEADLOCKS the dispatcher: an offscreen-capture read (observed: res 24) is
-                // waiting for compose/ASG commands queued *after* the CtxDetachResource, which
-                // the blocked dispatcher never delivers -> the readback wedges the VM. The
-                // freed-channel race is already handled structurally on the gfxstream side
-                // (patch 0014: ReadFromPipeToLinear/WriteToPipeFromLinear take a local
-                // shared_ptr copy of mHostPipe, so the pipe outlives the transfer across a
-                // concurrent detach), so the drain is no longer needed. Process it inline
-                // without blocking the dispatcher.
-                GpuCommand::CtxDetachResource(_) => {}
-                GpuCommand::ResourceCreate2d(info) => deferred_guard::wait_idle(info.resource_id),
-                GpuCommand::ResourceCreate3d(info) => deferred_guard::wait_idle(info.resource_id),
-                GpuCommand::ResourceCreateBlob(info) => {
-                    deferred_guard::wait_idle(info.resource_id)
-                }
-                _ => {}
-            }
+            // Resource-lifecycle commands (attach/detach/unref/create/ctx-detach) used
+            // to wait_idle here, draining any in-flight deferred read on the same
+            // resource before running, so the read never saw its backing/channel
+            // reallocated mid-transfer. That wait_idle DEADLOCKS the dispatch thread:
+            // during composition the guest rapidly frees and reuses resource ids, so an
+            // AttachBacking/Create/Unref on a *reused* id whose previous resource still
+            // has an in-flight read blocks the dispatcher -- and that read is waiting for
+            // compose/ASG commands the blocked dispatcher must still deliver. Result:
+            // SurfaceFlinger stalls in D on virtio_gpu_resource_create's fence, only a
+            // fraction of the frame composites (mostly-black scanout), and offscreen
+            // capture wedges. The read-vs-lifecycle race is already handled structurally
+            // on the gfxstream side -- mResources is shared_ptr + mutex (so Unref/Create
+            // can't free a resource under an in-flight read) and ReadFromPipeToLinear/
+            // WriteToPipeFromLinear take a local shared_ptr copy of mHostPipe (patch 0014,
+            // so a concurrent CtxDetach can't free the channel mid-transfer). So the drain
+            // is redundant; process every lifecycle command inline without blocking.
 
             let mut writer = Writer::new(&mem, head.clone())
                 .map_err(GpuError::QueueWriter)
