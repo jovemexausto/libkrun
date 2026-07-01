@@ -740,16 +740,18 @@ impl Worker {
                 }
                 GpuCommand::ResourceUnref(info) => deferred_guard::wait_idle(info.resource_id),
                 // CtxDetachResource -> VirtioGpuResource::DetachFromContext sets
-                // mHostPipe = nullptr, dropping the last shared_ptr to the context's
-                // RenderThreadPipe and freeing its RenderChannel. A deferred
-                // TransferFromHost3d read on this resource, running lock-free on the
-                // "gpu xfer" thread, is mid pipe->TransferFromHost at that moment and
-                // would dereference the freed channel (observed: SIGSEGV at 0x0 in
-                // VirtioGpuRenderThreadPipe::TransferFromHost). Drain it first, exactly
-                // like the resource-backing commands above.
-                GpuCommand::CtxDetachResource(info) => {
-                    deferred_guard::wait_idle(info.resource_id)
-                }
+                // mHostPipe = nullptr, freeing the context's RenderThreadPipe/RenderChannel.
+                // This used to wait_idle so an in-flight deferred TransferFromHost3d read on
+                // this resource wouldn't dereference the freed channel. But that wait_idle
+                // DEADLOCKS the dispatcher: an offscreen-capture read (observed: res 24) is
+                // waiting for compose/ASG commands queued *after* the CtxDetachResource, which
+                // the blocked dispatcher never delivers -> the readback wedges the VM. The
+                // freed-channel race is already handled structurally on the gfxstream side
+                // (patch 0014: ReadFromPipeToLinear/WriteToPipeFromLinear take a local
+                // shared_ptr copy of mHostPipe, so the pipe outlives the transfer across a
+                // concurrent detach), so the drain is no longer needed. Process it inline
+                // without blocking the dispatcher.
+                GpuCommand::CtxDetachResource(_) => {}
                 GpuCommand::ResourceCreate2d(info) => deferred_guard::wait_idle(info.resource_id),
                 GpuCommand::ResourceCreate3d(info) => deferred_guard::wait_idle(info.resource_id),
                 GpuCommand::ResourceCreateBlob(info) => {
