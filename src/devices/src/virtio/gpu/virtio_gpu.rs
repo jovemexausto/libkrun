@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::io::IoSliceMut;
 #[cfg(target_os = "linux")]
@@ -68,7 +68,7 @@ fn sglist_to_rutabaga_iovecs(
     Ok(rutabaga_iovecs)
 }
 
-#[derive(PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum VirtioGpuRing {
     Global,
     ContextSpecific { ctx_id: u32, ring_idx: u8 },
@@ -85,6 +85,31 @@ struct FenceDescriptor {
 pub struct FenceState {
     descs: Vec<FenceDescriptor>,
     completed_fences: BTreeMap<VirtioGpuRing, u64>,
+    // Fence ids of deferred TransferFromHost3d reads still in flight, per ring.
+    //
+    // The virtio-gpu fence contract is a per-ring timeline: when the guest sees
+    // a response carrying fence N it signals every pending fence <= N on that
+    // ring (virtio_gpu_fence_event_process in the guest kernel). A deferred
+    // read completes out of band on a helper thread, so if any command
+    // submitted after it (higher fence id, same ring) responds first, the
+    // guest treats the read as already done and consumes the reply buffer
+    // before the data has landed -- reading stale/zeroed bytes and desyncing
+    // the guest<->host GL stream (observed as aborted mid-stream texture
+    // uploads and permanently starved pipe replies). While any barrier fence
+    // is in flight, responses for higher fence ids on the same ring are parked
+    // in `descs` and only released once the read's data is visible.
+    deferred_read_barriers: BTreeMap<VirtioGpuRing, BTreeSet<u64>>,
+}
+
+impl FenceState {
+    // True if `fence_id`'s response must be held back because a deferred read
+    // with a lower fence id on the same ring has not landed its data yet.
+    fn barrier_blocks(&self, ring: &VirtioGpuRing, fence_id: u64) -> bool {
+        self.deferred_read_barriers
+            .get(ring)
+            .and_then(|s| s.iter().next())
+            .is_some_and(|min| *min < fence_id)
+    }
 }
 
 #[derive(Copy, Clone, Debug, Default)]
@@ -185,8 +210,10 @@ impl VirtioGpu {
 
             while i < fence_state.descs.len() {
                 debug!("XXX - fence_id: {}", fence_state.descs[i].fence_id);
+                let desc_fence_id = fence_state.descs[i].fence_id;
                 if fence_state.descs[i].ring == ring
-                    && fence_state.descs[i].fence_id <= completed_fence.fence_id
+                    && desc_fence_id <= completed_fence.fence_id
+                    && !fence_state.barrier_blocks(&ring, desc_fence_id)
                 {
                     let completed_desc = fence_state.descs.remove(i);
                     debug!(
@@ -860,7 +887,16 @@ impl VirtioGpu {
         // In case the fence is signaled immediately after creation, don't add a return
         // FenceDescriptor.
         let mut fence_state = self.fence_state.lock().unwrap();
-        if fence_id > *fence_state.completed_fences.get(&ring).unwrap_or(&0) {
+        // See FenceState::deferred_read_barriers: responding now while a lower
+        // deferred-read fence is in flight would make the guest's fence
+        // timeline signal that read before its data landed. Park the response;
+        // it is released by complete_deferred_read_fence() once the read's
+        // data is visible.
+        let blocked = fence_state.barrier_blocks(&ring, fence_id);
+        if blocked {
+            debug!("holding fence {fence_id} response behind an in-flight deferred read");
+        }
+        if blocked || fence_id > *fence_state.completed_fences.get(&ring).unwrap_or(&0) {
             fence_state.descs.push(FenceDescriptor {
                 ring,
                 fence_id,
@@ -871,6 +907,64 @@ impl VirtioGpu {
             false
         } else {
             true
+        }
+    }
+
+    /// Registers a deferred TransferFromHost3d read's fence as an in-flight
+    /// barrier on its ring. Must be called on the dispatch thread, at the
+    /// point the read is deferred, so the barrier is in place before any later
+    /// command on the ring can complete. See FenceState::deferred_read_barriers.
+    pub fn register_deferred_read_fence(&self, ring: VirtioGpuRing, fence_id: u64) {
+        let mut fence_state = self.fence_state.lock().unwrap();
+        fence_state
+            .deferred_read_barriers
+            .entry(ring)
+            .or_default()
+            .insert(fence_id);
+    }
+
+    /// Lifts the barrier for a deferred read whose data is now visible in
+    /// guest memory, then releases any parked responses that became eligible,
+    /// in fence-id order. Call from the read's helper thread right after the
+    /// blocking transfer returns (success or failure -- either way the read
+    /// will be answered and the timeline may advance).
+    pub fn complete_deferred_read_fence(
+        &self,
+        ring: VirtioGpuRing,
+        fence_id: u64,
+        mem: &GuestMemoryMmap,
+        queue_ctl: &Arc<Mutex<VirtQueue>>,
+        interrupt: &InterruptTransport,
+    ) {
+        // Same lock order as the fence handler: queue, then fence state.
+        let mut queue = queue_ctl.lock().unwrap();
+        let mut fence_state = self.fence_state.lock().unwrap();
+
+        if let Some(set) = fence_state.deferred_read_barriers.get_mut(&ring) {
+            set.remove(&fence_id);
+            if set.is_empty() {
+                fence_state.deferred_read_barriers.remove(&ring);
+            }
+        }
+
+        // Release parked responses that are already signaled (their fences
+        // completed while the barrier held them) and no longer blocked.
+        let completed = *fence_state.completed_fences.get(&ring).unwrap_or(&0);
+        let mut i = 0;
+        while i < fence_state.descs.len() {
+            let desc_fence_id = fence_state.descs[i].fence_id;
+            if fence_state.descs[i].ring == ring
+                && desc_fence_id <= completed
+                && !fence_state.barrier_blocks(&ring, desc_fence_id)
+            {
+                let released = fence_state.descs.remove(i);
+                if let Err(e) = queue.add_used(mem, released.desc_index, released.len) {
+                    error!("failed to add used elements to the queue: {e:?}");
+                }
+                interrupt.signal_used_queue();
+            } else {
+                i += 1;
+            }
         }
     }
 

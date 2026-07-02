@@ -656,6 +656,31 @@ impl Worker {
                     offset: info.offset,
                 };
                 let resource_id = info.resource_id;
+
+                // Preserve the virtio-gpu per-ring fence timeline across the
+                // deferral: the guest signals every fence <= N when it sees a
+                // response carrying fence N, so if any command submitted after
+                // this read (higher fence id, same ring) responds while the
+                // read is still in flight, the guest treats the read as done
+                // and consumes its reply buffer before the data lands. Register
+                // the read's fence as a barrier NOW, on the dispatch thread,
+                // before any later command can complete; later fenced responses
+                // on this ring are parked until the read's data is visible
+                // (see FenceState::deferred_read_barriers).
+                if hdr.flags & VIRTIO_GPU_FLAG_FENCE != 0 {
+                    let fence_ring = match hdr.flags & VIRTIO_GPU_FLAG_INFO_RING_IDX {
+                        0 => VirtioGpuRing::Global,
+                        _ => VirtioGpuRing::ContextSpecific {
+                            ctx_id: hdr.ctx_id,
+                            ring_idx: hdr.ring_idx,
+                        },
+                    };
+                    virtio_gpu
+                        .lock()
+                        .unwrap()
+                        .register_deferred_read_fence(fence_ring, hdr.fence_id);
+                }
+
                 let desc_table = control_queue.lock().unwrap().desc_table;
                 let queue_size = control_queue.lock().unwrap().actual_size();
                 let index = head.index;
@@ -841,6 +866,28 @@ impl Worker {
                 GpuResponse::ErrUnspec
             }
         };
+
+        // The read outcome is final: everything the guest will ever see for it
+        // (the reply data on success -- already copied into the resource's iovs
+        // by the blocking transfer above -- or nothing on failure) is in place.
+        // Lift the fence-timeline barrier registered at dispatch so the fenced
+        // responses parked behind this read are released, in order.
+        if hdr.flags & VIRTIO_GPU_FLAG_FENCE != 0 {
+            let fence_ring = match hdr.flags & VIRTIO_GPU_FLAG_INFO_RING_IDX {
+                0 => VirtioGpuRing::Global,
+                _ => VirtioGpuRing::ContextSpecific {
+                    ctx_id: hdr.ctx_id,
+                    ring_idx: hdr.ring_idx,
+                },
+            };
+            virtio_gpu.lock().unwrap().complete_deferred_read_fence(
+                fence_ring,
+                hdr.fence_id,
+                &mem,
+                &control_queue,
+                &interrupt,
+            );
+        }
 
         let Some(chain) = DescriptorChain::checked_new(&mem, desc_table, queue_size, index) else {
             error!("deferred transfer_read: failed to rebuild descriptor chain for index {index}");
