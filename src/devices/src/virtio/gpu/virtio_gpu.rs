@@ -1152,49 +1152,60 @@ impl VirtioGpu {
             .get_mut(&resource_id)
             .ok_or(ErrInvalidResourceId)?;
 
-        let map_info = self.rutabaga.map_info(resource_id).map_err(|_| ErrUnspec)?;
-        let map_ptr = self.rutabaga.map_ptr(resource_id).map_err(|_| ErrUnspec)?;
+        let map_info = self.rutabaga.map_info(resource_id).map_err(|e| {
+            error!("resource_map_blob: map_info failed for resource {resource_id}: {e:?}");
+            ErrUnspec
+        })?;
+        let map_ptr = self.rutabaga.map_ptr(resource_id).map_err(|e| {
+            error!("resource_map_blob: map_ptr failed for resource {resource_id}: {e:?}");
+            ErrUnspec
+        })?;
 
-        if let Ok(export) = self.rutabaga.export_blob(resource_id) {
-            debug!(
-                "resource_map_blob: export handle_type={} map_ptr={:x}",
-                export.handle_type, map_ptr
-            );
-
-            if export.handle_type == RUTABAGA_MEM_HANDLE_TYPE_APPLE
-                || export.handle_type == RUTABAGA_MEM_HANDLE_TYPE_SHM
+        // The mapping below only consumes gfxstream's host pointer (map_ptr)
+        // plus the HVF aliasing into the guest window -- the export handle is
+        // never used. Vulkan host-visible allocations (Skia's CpuToGpu arenas)
+        // often have no exportable descriptor on macOS/MoltenVK, so a failed
+        // export must not veto the mapping; only a handle of a genuinely
+        // unsupported type does.
+        match self.rutabaga.export_blob(resource_id) {
+            Ok(export)
+                if export.handle_type != RUTABAGA_MEM_HANDLE_TYPE_APPLE
+                    && export.handle_type != RUTABAGA_MEM_HANDLE_TYPE_SHM =>
             {
-                if offset + resource.size > shm_region.size as u64 {
-                    error!("mapping DOES NOT FIT");
-                    return Err(ErrUnspec);
-                }
-
-                let guest_addr = shm_region.guest_addr + offset;
-                debug!(
-                    "mapping: map_ptr={:x}, guest_addr={:x}, size={}",
-                    map_ptr, guest_addr, resource.size
-                );
-
-                let (reply_sender, reply_receiver) = unbounded();
-                self.map_sender
-                    .send(WorkerMessage::GpuAddMapping(
-                        reply_sender,
-                        map_ptr,
-                        guest_addr,
-                        resource.size,
-                    ))
-                    .unwrap();
-                if !reply_receiver.recv().unwrap() {
-                    return Err(ErrUnspec);
-                }
-            } else {
                 error!(
                     "resource_map_blob: unsupported export handle_type={} for resource {}",
                     export.handle_type, resource_id
                 );
                 return Err(ErrUnspec);
             }
-        } else {
+            _ => {}
+        }
+
+        if offset + resource.size > shm_region.size as u64 {
+            error!("mapping DOES NOT FIT");
+            return Err(ErrUnspec);
+        }
+
+        let guest_addr = shm_region.guest_addr + offset;
+        debug!(
+            "mapping: map_ptr={:x}, guest_addr={:x}, size={}",
+            map_ptr, guest_addr, resource.size
+        );
+
+        let (reply_sender, reply_receiver) = unbounded();
+        self.map_sender
+            .send(WorkerMessage::GpuAddMapping(
+                reply_sender,
+                map_ptr,
+                guest_addr,
+                resource.size,
+            ))
+            .unwrap();
+        if !reply_receiver.recv().unwrap() {
+            error!(
+                "resource_map_blob: GpuAddMapping failed for resource {} (ptr={:x} size={})",
+                resource_id, map_ptr, resource.size
+            );
             return Err(ErrUnspec);
         }
 

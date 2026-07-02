@@ -692,27 +692,50 @@ impl RutabagaComponent for Gfxstream {
         let handle = self.export_blob(resource_id).ok();
 
         #[cfg(target_os = "macos")]
-        let map_ptr = handle.as_ref().and_then(|h| {
-            if h.handle_type == RUTABAGA_MEM_HANDLE_TYPE_SHM {
-                let addr = unsafe {
-                    libc::mmap(
-                        null_mut(),
-                        resource_create_blob.size as usize,
-                        libc::PROT_READ | libc::PROT_WRITE,
-                        libc::MAP_SHARED,
-                        h.os_handle.as_raw_descriptor(),
-                        0,
-                    )
-                };
-                if addr == libc::MAP_FAILED {
-                    None
+        let map_ptr = {
+            let shm_ptr = handle.as_ref().and_then(|h| {
+                if h.handle_type == RUTABAGA_MEM_HANDLE_TYPE_SHM {
+                    let addr = unsafe {
+                        libc::mmap(
+                            null_mut(),
+                            resource_create_blob.size as usize,
+                            libc::PROT_READ | libc::PROT_WRITE,
+                            libc::MAP_SHARED,
+                            h.os_handle.as_raw_descriptor(),
+                            0,
+                        )
+                    };
+                    if addr == libc::MAP_FAILED {
+                        None
+                    } else {
+                        Some(addr as u64)
+                    }
                 } else {
-                    Some(addr as u64)
+                    None
                 }
-            } else {
-                None
-            }
-        });
+            });
+
+            // Vulkan host-visible allocations (e.g. Skia's persistently-mapped
+            // CpuToGpu vertex arenas) carry no SHM descriptor to mmap; without a
+            // map_ptr every RESOURCE_MAP_BLOB on them fails ("no map ptr
+            // available"), the guest's SkiaVk RenderEngine cannot allocate, and
+            // offscreen composition (screencap/scrcpy) renders blank. Fall back
+            // to gfxstream's own mapping (a vkMapMemory wrapper) for the host
+            // pointer; gfxstream keeps that mapping alive for the resource's
+            // lifetime. Failure is fine (non-mappable blobs) and preserves the
+            // previous behavior.
+            shm_ptr.or_else(|| {
+                let mut map: *mut c_void = null_mut();
+                let mut size: u64 = 0;
+                let ret =
+                    unsafe { stream_renderer_resource_map(resource_id, &mut map, &mut size) };
+                if ret == 0 && !map.is_null() {
+                    Some(map as u64)
+                } else {
+                    None
+                }
+            })
+        };
 
         Ok(RutabagaResource {
             resource_id,
